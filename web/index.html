@@ -57,7 +57,8 @@
   <div>
     <div class="card">
       <h2>① 字库清单（按优先顺序）</h2>
-      <p class="muted">CSV 列：字库,版次,字模号,字。全量替换当前生效清单。
+      <p class="muted">CSV 列：字库,版次,字模号,字。全量替换当前生效清单：
+        仅当整单校验通过并保存成功后才切换为最新清单，失败仍沿用上一份。
         <a href="/samples/libraries.csv" target="_blank">下载样例</a></p>
       <input type="file" id="libFile" accept=".csv,text/csv">
       <button onclick="uploadLib()">上传字库清单</button>
@@ -137,7 +138,12 @@ async function uploadLib() {
   const fd = new FormData(); fd.append("file", f);
   try {
     const d = await post("/api/libraries", fd);
-    show("libMsg", `已替换字库清单：${d.library_count} 个字库、${d.glyph_count} 个字模`, true);
+    show("libMsg",
+      `清单已生效（版本 #${d.library_list_id}` +
+      (d.previous_library_list_id == null
+        ? "，首次上传）"
+        : `，替换旧版本 #${d.previous_library_list_id}）`) +
+      `：${d.library_count} 个字库、${d.glyph_count} 个字模`, true);
     loadState();
   } catch (e) { show("libMsg", e.message, false); }
 }
@@ -198,8 +204,14 @@ function ident(x) { return `${x.glyph_char}（${x.library_name}/${x.edition}/${x
 async function loadState() {
   const d = await (await fetch("/api/state")).json();
   const box = document.getElementById("stateBox");
-  let html = `<p class="muted">当前生效字库：${d.libraries.map(l =>
-      `${l.name}·${l.edition}(优先级${l.priority})`).join(" → ") || "（未上传）"}</p>`;
+  const cur = d.current_library_list;
+  const curText = cur
+    ? `版本 #${cur.list_id}（来源：${cur.source === "upload" ? "网页上传" : cur.source}，${cur.created_at}）`
+    : "（尚未成功上传）";
+  let html = `<p class="muted">当前生效字库清单：<b>${curText}</b><br>` +
+    `字库优先级：${d.libraries.map(l =>
+      `${l.name}·${l.edition}(优先级${l.priority})`).join(" → ") || "（无）"}<br>` +
+    `历史清单版本：${d.library_list_history.map(x => "#" + x.list_id).join("、") || "（无）"}</p>`;
   for (const v of d.volumes) {
     html += `<div class="vol"><h3>册「${v.volume}」</h3>
       <div class="chars">用字：${v.chars.join("")}</div>
@@ -214,9 +226,10 @@ async function loadOrders() {
   const d = await (await fetch("/api/orders")).json();
   const box = document.getElementById("ordersBox");
   if (!d.length) { box.innerHTML = "<p class='muted'>暂无。</p>"; return; }
-  let html = "<table><tr><th>生效序</th><th>单号</th><th>册</th><th>增</th><th>减</th><th>操作</th></tr>";
+  let html = "<table><tr><th>生效序</th><th>单号</th><th>册</th><th>清单版本</th><th>增</th><th>减</th><th>操作</th></tr>";
   for (const o of d) {
     html += `<tr><td>${o.seq}</td><td>${o.order_no}</td><td>${o.volume}</td>
+      <td>${o.library_list_id == null ? "—" : "#" + o.library_list_id}</td>
       <td><span class="tag add">+${o.added_count}</span></td>
       <td><span class="tag del">-${o.removed_count}</span></td>
       <td><a href="/api/orders/${o.order_no}/download">CSV</a> ·

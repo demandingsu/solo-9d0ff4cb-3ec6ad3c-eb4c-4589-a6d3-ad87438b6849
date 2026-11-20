@@ -1,14 +1,21 @@
-"""核心业务逻辑：字库装载、逐字取字库、交印出单。
+"""核心业务逻辑：清单版本化装载、逐字取字库、交印出单。
 
 规则要点
 --------
-1. 每个字取“按优先顺序第一个收录它的字库”，以 (字库, 版次, 字模号) 识别字模。
-2. 交印一册只更新该册选用的字模，其余册沿用各自上次交印的清单。
-3. 比对交印前后“各册共需的字模（并集）”生成增减单。
-4. 交印事务串行化（BEGIN IMMEDIATE + 库内应用级互斥锁），逐单生效，
+1. 每次“成功上传”的字库清单整体存为一个不可变版本；app_meta 中的指针始终
+   指向最近一次成功上传的清单。上传失败（含校验失败/保存失败）指针不动，
+   继续使用上一份清单。
+2. 一笔交印只引用一份完整清单：进入交印事务时锁定当前清单 ID，逐字按该清单
+   的文件优先顺序取第一个收录它的字库，以 (字库, 版次, 字模号) 识别字模；
+   有缺字则整笔拒绝，各册仍沿用原清单。
+3. 已交印册的字模以 glyph_id 固定在各自交印时的清单版本上，历史单据原样保留；
+   旧增减单仍可按单号原样重取与下载。
+4. 同一字库同一版次内，字模号始终对应同一个字：新清单与任一历史版本冲突即拒绝。
+5. 交印一册只更新该册选用的字模，其余册沿用各自上次交印的清单。
+6. 比对交印前后“各册共需的字模（并集）”生成增减单。
+7. 上传与交印共用进程内互斥锁，叠加 BEGIN IMMEDIATE + busy_timeout，逐单生效，
    每单提交前后都校验并集与各册清单一致。
-5. 重复确认同一笔交印复用原单，按单号可原样重取。
-6. 缺字或保存失败时回滚，仍沿用原清单。
+8. 重复确认同一笔交印复用原单，按单号可原样重取。
 """
 from __future__ import annotations
 
@@ -18,13 +25,13 @@ import sqlite3
 import threading
 from datetime import datetime, timezone
 
-from .database import connect, init_db
+from .database import META_CURRENT_LIST, connect, init_db
 from .errors import DomainError, MissingGlyphError, SaveError
 from .parsers import LibraryRow
 
-# 进程内互斥：保证多人同时交印按生效次序逐单出单。
+# 进程内互斥：上传替换与交印共用，保证清单指针切换与交印选字互不穿插。
 # 数据库层 BEGIN IMMEDIATE + busy_timeout 则在多进程/多连接下兜底。
-_submit_lock = threading.Lock()
+_write_lock = threading.Lock()
 
 IDENTITY_KEYS = ("library_name", "edition", "matrix_no", "glyph_char")
 
@@ -45,54 +52,82 @@ def _sorted_idents(idents: list[dict]) -> list[dict]:
     return sorted(idents, key=_ident_key)
 
 
+def _get_current_list_id(conn: sqlite3.Connection) -> int | None:
+    row = conn.execute(
+        "SELECT value FROM app_meta WHERE key=?", (META_CURRENT_LIST,)
+    ).fetchone()
+    return int(row["value"]) if row is not None else None
+
+
 def replace_libraries(rows: list[LibraryRow]) -> dict:
-    """全量替换当前生效字库清单（按文件顺序定优先次序）。"""
-    conn = connect()
-    try:
-        conn.execute("BEGIN IMMEDIATE")
-        # 1. 校验同一 (字库, 版次) 的版次一致——(字库,版次) 相同天然一致；
-        #    这里校验同一字库名若出现多个版次，允许但分别视作不同字库条目。
-        # 2. 旧库标记为非当前（保留仍被各册引用的字模行，保证历史清单可追溯）。
-        conn.execute("UPDATE libraries SET current=0")
+    """全量替换字库清单：整单校验通过后写入新版本并切换当前清单指针。
 
-        lib_id: dict[tuple[str, str], int] = {}
-        priority = 0
-        for r in rows:
-            key = (r.library, r.edition)
-            if key not in lib_id:
-                priority += 1
-                cur = conn.execute(
-                    "SELECT library_id FROM libraries WHERE name=? AND edition=?",
-                    key,
+    任何校验或保存失败都不会改动指针，系统继续使用上一份清单。
+    """
+    with _write_lock:
+        conn = connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            previous_list_id = _get_current_list_id(conn)
+
+            # 1. 恒定不变量：同一 (字库, 版次, 字模号) 在所有历史版本中必须对应同一个字。
+            for r in rows:
+                clash = conn.execute(
+                    """
+                    SELECT g.glyph_char AS old_char
+                    FROM glyphs g
+                    JOIN libraries l ON l.library_id = g.library_id
+                    WHERE l.name=? AND l.edition=? AND g.matrix_no=?
+                      AND g.glyph_char != ?
+                    LIMIT 1
+                    """,
+                    (r.library, r.edition, r.matrix_no, r.glyph_char),
                 ).fetchone()
-                if cur is None:
-                    lid = conn.execute(
-                        "INSERT INTO libraries(name, edition, priority, current) "
-                        "VALUES (?,?,?,1)",
-                        (r.library, r.edition, priority),
-                    ).lastrowid
-                else:
-                    lid = cur["library_id"]
-                    conn.execute(
-                        "UPDATE libraries SET priority=?, current=1 WHERE library_id=?",
-                        (priority, lid),
+                if clash is not None:
+                    raise DomainError(
+                        f"字模号恒定校验失败：{r.library}/{r.edition}/{r.matrix_no} "
+                        f"历史清单对应“{clash['old_char']}”，本次清单对应“{r.glyph_char}”；"
+                        "同一字库同一版次内字模号必须始终对应同一个字，本次上传未生效"
                     )
-                lib_id[key] = lid
-            conn.execute(
-                "INSERT OR IGNORE INTO glyphs(library_id, matrix_no, glyph_char) "
-                "VALUES (?,?,?)",
-                (lib_id[key], r.matrix_no, r.glyph_char),
-            )
 
-        # 非当前库中已无人引用的字模/库记录可清理，这里保留库行、保留字模行，
-        # 仅作 current=0 标记，避免误删历史快照引用。
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+            # 2. 整单写入一个全新的不可变清单版本（旧版本原样保留）。
+            list_id = conn.execute(
+                "INSERT INTO library_lists(source) VALUES ('upload')"
+            ).lastrowid
+
+            lib_id: dict[tuple[str, str], int] = {}
+            priority = 0
+            for r in rows:
+                key = (r.library, r.edition)
+                if key not in lib_id:
+                    priority += 1
+                    lid = conn.execute(
+                        "INSERT INTO libraries(list_id, name, edition, priority) "
+                        "VALUES (?,?,?,?)",
+                        (list_id, r.library, r.edition, priority),
+                    ).lastrowid
+                    lib_id[key] = lid
+                conn.execute(
+                    "INSERT INTO glyphs(library_id, list_id, matrix_no, glyph_char) "
+                    "VALUES (?,?,?,?)",
+                    (lib_id[key], list_id, r.matrix_no, r.glyph_char),
+                )
+
+            # 3. 指针切换到新清单；只有走到这里提交成功，新清单才生效。
+            conn.execute(
+                "INSERT INTO app_meta(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (META_CURRENT_LIST, str(list_id)),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
     return {
+        "library_list_id": list_id,
+        "previous_library_list_id": previous_list_id,
         "library_count": len({(r.library, r.edition) for r in rows}),
         "glyph_count": len(rows),
         "replaced_at": _now_iso(),
@@ -127,19 +162,19 @@ def replace_volume_chars(volume_name: str, chars: list[str]) -> dict:
     return {"volume": volume_name, "char_count": len(chars), "updated_at": _now_iso()}
 
 
-def _resolve_char(conn: sqlite3.Connection, ch: str) -> dict | None:
-    """按字库优先顺序取第一个收录该字的字模。"""
+def _resolve_char(conn: sqlite3.Connection, list_id: int, ch: str) -> dict | None:
+    """只在指定清单版本内，按字库优先顺序取第一个收录该字的字模。"""
     row = conn.execute(
         """
         SELECT l.name AS library_name, l.edition, g.matrix_no, g.glyph_char,
                g.glyph_id, l.library_id
         FROM glyphs g
         JOIN libraries l ON l.library_id = g.library_id
-        WHERE g.glyph_char = ? AND l.current = 1
+        WHERE g.list_id = ? AND g.glyph_char = ?
         ORDER BY l.priority ASC, g.matrix_no ASC
         LIMIT 1
         """,
-        (ch,),
+        (list_id, ch),
     ).fetchone()
     if row is None:
         return None
@@ -194,7 +229,7 @@ def _fingerprint(volume_id: int, chars: list[str], target: list[dict]) -> str:
 
 
 def _assert_pool_consistent(conn: sqlite3.Connection, stage: str) -> None:
-    """校验：各册 active 并集 == 按各册用字解析出的需求并集（已交印册）。"""
+    """校验：各册 active 并集 == 按各册 active 清单解析出的需求并集（已交印册）。"""
     actual = {_ident_key(x) for x in _load_pool(conn)}
     expected: set[tuple] = set()
     vols = conn.execute("SELECT volume_id FROM volumes").fetchall()
@@ -217,7 +252,7 @@ def submit_volume(
     fail_commit: bool = False,
 ) -> dict:
     """交印一册，返回增减单（原单复用则 reused=True）。"""
-    with _submit_lock:
+    with _write_lock:
         return _submit_tx(volume_name, idem_key, fail_commit)
 
 
@@ -231,6 +266,11 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         if vol is None:
             raise DomainError(f"册“{volume_name}”不存在，请先上传用字表", 404)
         volume_id = vol["volume_id"]
+
+        # 整笔交印只使用一份完整清单：事务开始即锁定当前清单版本。
+        list_id = _get_current_list_id(conn)
+        if list_id is None:
+            raise DomainError("尚未成功上传过字库清单，无法交印", 400)
 
         # 1. 幂等键命中：原样复用
         if idem_key:
@@ -253,11 +293,12 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
         if not chars:
             raise DomainError(f"册“{volume_name}”的用字表为空", 404)
 
-        # 2. 逐字取第一个收录它的字库；有缺字则整体失败，沿用原清单
+        # 2. 只按锁定的清单版本逐字取第一个收录它的字库；有缺字则整笔拒绝，
+        #    不动任何册的原清单，也不产生新单。
         resolved: list[dict] = []
         missing: list[str] = []
         for ch in chars:
-            found = _resolve_char(conn, ch)
+            found = _resolve_char(conn, list_id, ch)
             if found is None:
                 missing.append(ch)
             else:
@@ -291,7 +332,7 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
 
         # 4. 交印前共需并集（含本册旧清单）
         pool_before = _load_pool(conn)
-        before_keys = {_ident_key(x) for x in pool_before}
+        before_pool_keys = {_ident_key(x) for x in pool_before}
 
         # 5. 只更新本册
         conn.execute("DELETE FROM active_matrices WHERE volume_id=?", (volume_id,))
@@ -302,9 +343,9 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
 
         # 6. 交印后共需并集，逐字模比对生成增减单
         pool_after = _load_pool(conn)
-        after_keys = {_ident_key(x) for x in pool_after}
-        added = _sorted_idents([x for x in pool_after if _ident_key(x) not in before_keys])
-        removed = _sorted_idents([x for x in pool_before if _ident_key(x) not in after_keys])
+        after_pool_keys = {_ident_key(x) for x in pool_after}
+        added = _sorted_idents([x for x in pool_after if _ident_key(x) not in before_pool_keys])
+        removed = _sorted_idents([x for x in pool_before if _ident_key(x) not in after_pool_keys])
 
         # 7. 逐单校验：提交前后共需并集都必须与各册 active 清单一致
         _assert_pool_consistent(conn, "交印后")
@@ -322,6 +363,7 @@ def _submit_tx(volume_name: str, idem_key: str | None, fail_commit: bool) -> dic
             "idem_key": idem_key,
             "reused": False,
             "fingerprint": fp,
+            "library_list_id": list_id,
             "effective_at": _now_iso(),
             "pool_before": pool_before,
             "pool_after": pool_after,
@@ -400,6 +442,7 @@ def list_orders(volume_name: str | None = None) -> list[dict]:
                     "seq": r["seq"],
                     "volume": r["volume_name"],
                     "created_at": r["created_at"],
+                    "library_list_id": p.get("library_list_id"),
                     "added_count": len(p["added"]),
                     "removed_count": len(p["removed"]),
                 }
@@ -410,14 +453,30 @@ def list_orders(volume_name: str | None = None) -> list[dict]:
 
 
 def get_state() -> dict:
-    """当前工位全貌：字库、各册用字与已交印字模、共需并集。"""
+    """当前工位全貌：清单版本、字库、各册用字与已交印字模、共需并集。"""
     conn = connect()
     try:
+        current_list_id = _get_current_list_id(conn)
+        current_list = None
+        if current_list_id is not None:
+            row = conn.execute(
+                "SELECT list_id, source, created_at FROM library_lists WHERE list_id=?",
+                (current_list_id,),
+            ).fetchone()
+            if row is not None:
+                current_list = dict(row)
         libs = [
             dict(r)
             for r in conn.execute(
-                "SELECT name, edition, priority, current FROM libraries "
-                "WHERE current=1 ORDER BY priority"
+                "SELECT name, edition, priority FROM libraries "
+                "WHERE list_id=? ORDER BY priority",
+                (current_list_id,),
+            ).fetchall()
+        ] if current_list_id is not None else []
+        list_history = [
+            dict(r)
+            for r in conn.execute(
+                "SELECT list_id, source, created_at FROM library_lists ORDER BY list_id"
             ).fetchall()
         ]
         volumes = []
@@ -435,7 +494,13 @@ def get_state() -> dict:
                 {"volume": v["name"], "chars": chars, "active_matrices": active}
             )
         pool = _load_pool(conn)
-        return {"libraries": libs, "volumes": volumes, "shared_pool": pool}
+        return {
+            "current_library_list": current_list,
+            "library_list_history": list_history,
+            "libraries": libs,
+            "volumes": volumes,
+            "shared_pool": pool,
+        }
     finally:
         conn.close()
 
@@ -452,9 +517,13 @@ def reset_all() -> None:
             "volumes",
             "glyphs",
             "libraries",
+            "library_lists",
+            "app_meta",
         ):
             conn.execute(f"DELETE FROM {table}")
         conn.execute("UPDATE submit_seq SET seq=0")
+        # 清空后 AUTOINCREMENT 序列归零，便于演示反复使用。
+        conn.execute("DELETE FROM sqlite_sequence")
         conn.commit()
     except Exception:
         conn.rollback()
@@ -464,5 +533,5 @@ def reset_all() -> None:
 
 
 def ensure_db() -> None:
-    """建表并初始化序号（连接时会自动创建数据目录）。"""
+    """建表/升级旧库并初始化序号（连接时会自动创建数据目录）。"""
     init_db()
